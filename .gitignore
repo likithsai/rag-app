@@ -1,0 +1,6 @@
+vector_store
+node_modules
+dist
+logs
+
+package-lock.json
