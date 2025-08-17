@@ -10,6 +10,7 @@ import csvParser from "csv-parser";
 import { JSDOM } from "jsdom";
 import winston from "winston";
 import dotenv from "dotenv";
+import crypto from "crypto";
 
 import { Ollama } from "@langchain/community/llms/ollama";
 import { OllamaEmbeddings } from "@langchain/community/embeddings/ollama";
@@ -183,7 +184,8 @@ async function initializeKnowledgeBase() {
 
 // --- Chat handler
 async function handleChat(
-  message: string
+  message: string,
+  useRAG?: boolean
 ): Promise<{ reply: string; source: "RAG" | "LLM" }> {
   const llm = new Ollama({
     model: LLM_MODEL,
@@ -191,60 +193,80 @@ async function handleChat(
     callbacks: [
       {
         handleLLMNewToken(token: string) {
-          logger.info(`[LLM TOKEN]: ${token}`);
+          process.stdout.write(token); // continuous token printing
         },
       },
     ],
   });
 
-  if (vectorStore) {
+  let contextText = "";
+  let source: "RAG" | "LLM" = "LLM";
+
+  // --- RAG retrieval
+  if (vectorStore && useRAG) {
     const retriever = vectorStore.asRetriever({ k: TOP_K });
     const relevantDocs = await retriever.getRelevantDocuments(message);
 
     if (relevantDocs.length) {
-      const contextText = relevantDocs
+      contextText = relevantDocs
         .map((d) => d.metadata.summary || d.pageContent.slice(0, 500))
         .join("\n\n");
-
-      const prompt = PromptTemplate.fromTemplate(`
-        You are an AI assistant. Use the provided context to answer the user's question. 
-        If the answer cannot be found in the context, respond honestly that the information is not available.
-        Context:
-        {context}
-
-        Question:
-        {question}
-
-        Answer:
-      `);
-
-      const chain = RunnableSequence.from([
-        {
-          context: new RunnablePassthrough(),
-          question: new RunnablePassthrough(),
-        },
-        prompt,
-        llm,
-        new StringOutputParser(),
-      ]);
-
-      const reply = await chain.invoke({
-        context: contextText,
-        question: message,
-      });
-      return { reply, source: "RAG" }; // indicate RAG
-    } else {
-      return {
-        reply: "I could not find relevant documents. Ask me anything else!",
-        source: "RAG",
-      };
+      source = "RAG";
     }
   }
 
-  const reply = await llm.call(
-    `You are a helpful AI assistant.\nUser: ${message}\nAssistant:`
-  );
-  return { reply, source: "LLM" }; // indicate direct LLM
+  // --- Single prompt
+  const promptTemplate = `
+    You are a helpful AI assistant.
+    ${
+      contextText
+        ? "Use the provided context to answer the user's question.\nContext:\n{context}"
+        : ""
+    }
+    
+    Question:
+    {question}
+
+    Answer:
+  `;
+  const prompt = PromptTemplate.fromTemplate(promptTemplate);
+
+  const chain = RunnableSequence.from([
+    { context: new RunnablePassthrough(), question: new RunnablePassthrough() },
+    prompt,
+    llm,
+    new StringOutputParser(),
+  ]);
+
+  const reply = await chain.invoke({
+    context: contextText,
+    question: message,
+  });
+
+  // --- Update RAG dynamically with new info if applicable
+  if (vectorStore) {
+    const newInfoHash = crypto.createHash("sha256").update(reply).digest("hex");
+
+    // Check if this response is already in the vector store
+    const exists = (vectorStore as any).docs?.some(
+      (d: Document) => d.metadata.hash === newInfoHash
+    );
+
+    if (!exists) {
+      const newDoc = new Document({
+        pageContent: reply,
+        metadata: { source: "dynamic-chat", hash: newInfoHash },
+      });
+
+      // Only pass the document array; embeddings are handled internally
+      await vectorStore.addDocuments([newDoc]);
+      await vectorStore.save(VECTOR_STORE_PATH);
+
+      console.log("\n[RAG] Added new info to vector store dynamically.");
+    }
+  }
+
+  return { reply, source };
 }
 
 // --- Vector store stats endpoint
