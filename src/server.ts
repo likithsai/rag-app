@@ -6,6 +6,8 @@ import fs from "fs";
 import path from "path";
 import pdfParse from "pdf-parse";
 import mammoth from "mammoth";
+import csvParser from "csv-parser";
+import { JSDOM } from "jsdom";
 import winston from "winston";
 import dotenv from "dotenv";
 
@@ -29,6 +31,13 @@ const PUBLIC_FOLDER = process.env.PUBLIC_FOLDER || "./public";
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "nomic-embed-text";
 const LLM_MODEL = process.env.LLM_MODEL || "llama3.1";
 const VECTOR_STORE_PATH = "./vector_store";
+const BATCH_SIZE = 5; // batch processing chunks
+const TOP_K = 5; // top retrieved documents
+const SUPPORTED_FILE_FORMATS = (
+  process.env.SUPPORTED_FILE_FORMATS || ".pdf,.txt,.docx,.csv,.html,.md"
+)
+  .split(",")
+  .map((f) => f.trim().toLowerCase());
 
 // --- Logger setup
 const logger = winston.createLogger({
@@ -74,7 +83,8 @@ let vectorStore: HNSWLib | null = null;
 // --- File helpers
 const fileExists = (p: string) => fs.existsSync(p);
 const isSupportedFile = (filePath: string) =>
-  [".pdf", ".txt", ".docx"].includes(path.extname(filePath).toLowerCase());
+  SUPPORTED_FILE_FORMATS.includes(path.extname(filePath).toLowerCase());
+
 const getAllFiles = (folderPath: string): string[] =>
   fileExists(folderPath)
     ? fs.readdirSync(folderPath, { withFileTypes: true }).flatMap((item) => {
@@ -91,7 +101,7 @@ const getAllFiles = (folderPath: string): string[] =>
 async function processFile(filePath: string): Promise<Document[]> {
   try {
     const fileName = path.basename(filePath);
-    console.log(`\x1b[32mProcessing file:\x1b[0m ${fileName}`); // Green text
+    logger.info(`Processing file: ${fileName}`);
 
     let text = "";
     const ext = path.extname(filePath).toLowerCase();
@@ -100,23 +110,32 @@ async function processFile(filePath: string): Promise<Document[]> {
     else if (ext === ".txt") text = fs.readFileSync(filePath, "utf-8");
     else if (ext === ".docx")
       text = (await mammoth.extractRawText({ path: filePath })).value;
+    else if (ext === ".csv") {
+      text = "";
+      await new Promise<void>((resolve) => {
+        fs.createReadStream(filePath)
+          .pipe(csvParser())
+          .on("data", (row) => {
+            text += Object.values(row).join(" ") + "\n";
+          })
+          .on("end", () => resolve());
+      });
+    } else if (ext === ".html") {
+      const html = fs.readFileSync(filePath, "utf-8");
+      text = new JSDOM(html).window.document.body.textContent || "";
+    } else if (ext === ".md") text = fs.readFileSync(filePath, "utf-8");
 
     const splitter = new RecursiveCharacterTextSplitter({
       chunkSize: 500,
       chunkOverlap: 50,
     });
 
-    // Await the Promise before iterating
     const chunks = await splitter.splitDocuments([
-      new Document({
-        pageContent: text,
-        metadata: { source: fileName },
-      }),
+      new Document({ pageContent: text, metadata: { source: fileName } }),
     ]);
 
-    // Log each chunk's source file
     chunks.forEach((chunk, idx) =>
-      console.log(`\x1b[36m[Chunk ${idx + 1}]\x1b[0m from ${fileName}`)
+      logger.info(`[Chunk ${idx + 1}] from ${fileName}`)
     );
 
     return chunks;
@@ -145,26 +164,55 @@ async function initializeKnowledgeBase() {
     return;
   }
 
-  logger.info(`Found ${files.length} files. Processing...`);
-  const allDocs = (await Promise.all(files.map(processFile))).flat();
+  logger.info(`Found ${files.length} files. Processing in batches...`);
+
+  let allDocs: Document[] = [];
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    const batchFiles = files.slice(i, i + BATCH_SIZE);
+    const batchDocs = (await Promise.all(batchFiles.map(processFile))).flat();
+    allDocs = allDocs.concat(batchDocs);
+    logger.info(
+      `Processed batch ${i / BATCH_SIZE + 1}, total chunks: ${allDocs.length}`
+    );
+  }
+
   vectorStore = await HNSWLib.fromDocuments(allDocs, embeddings);
   await vectorStore.save(VECTOR_STORE_PATH);
   logger.info(`Knowledge base initialized with ${allDocs.length} chunks.`);
 }
 
 // --- Chat handler
-async function handleChat(message: string): Promise<string> {
-  const llm = new Ollama({ model: LLM_MODEL, temperature: 0.7 });
-  const userWantsDocs = /fetch|search|documents?|pdf|txt|docx/i.test(message);
+async function handleChat(
+  message: string
+): Promise<{ reply: string; source: "RAG" | "LLM" }> {
+  const llm = new Ollama({
+    model: LLM_MODEL,
+    temperature: 0.7,
+    callbacks: [
+      {
+        handleLLMNewToken(token: string) {
+          logger.info(`[LLM TOKEN]: ${token}`);
+        },
+      },
+    ],
+  });
+
+  const userWantsDocs =
+    /fetch|search|documents?|pdf|txt|docx|csv|html|md/i.test(message);
 
   if (vectorStore && userWantsDocs) {
-    const retriever = vectorStore.asRetriever();
+    const retriever = vectorStore.asRetriever({ k: TOP_K });
     const relevantDocs = await retriever.getRelevantDocuments(message);
+
     if (relevantDocs.length) {
-      const contextText = relevantDocs.map((d) => d.pageContent).join("\n\n");
+      const contextText = relevantDocs
+        .map((d) => d.metadata.summary || d.pageContent.slice(0, 500))
+        .join("\n\n");
+
       const prompt = PromptTemplate.fromTemplate(
-        `Answer based on documents below. If answer not in docs, say so.\nContext:\n{context}\nQuestion:\n{question}\nAnswer:`
+        `Answer based on context below. If not found, say so.\nContext:\n{context}\nQuestion:\n{question}\nAnswer:`
       );
+
       const chain = RunnableSequence.from([
         {
           context: new RunnablePassthrough(),
@@ -174,17 +222,38 @@ async function handleChat(message: string): Promise<string> {
         llm,
         new StringOutputParser(),
       ]);
-      return chain.invoke({ context: contextText, question: message });
+
+      const reply = await chain.invoke({
+        context: contextText,
+        question: message,
+      });
+      return { reply, source: "RAG" }; // indicate RAG
     } else {
-      return "I could not find relevant documents. Ask me anything else!";
+      return {
+        reply: "I could not find relevant documents. Ask me anything else!",
+        source: "RAG",
+      };
     }
   }
 
-  // Normal chatbot response
-  return llm.call(
+  const reply = await llm.call(
     `You are a helpful AI assistant.\nUser: ${message}\nAssistant:`
   );
+  return { reply, source: "LLM" }; // indicate direct LLM
 }
+
+// --- Vector store stats endpoint
+app.get("/vector-stats", async (_req, res) => {
+  if (!vectorStore)
+    return res.status(404).json({ error: "Vector store not initialized." });
+  const stats = {
+    totalVectors: (vectorStore as any).docs?.length || 0,
+    files: getAllFiles(PUBLIC_FOLDER).length,
+    topK: TOP_K,
+    supportedFormats: SUPPORTED_FILE_FORMATS,
+  };
+  res.json(stats);
+});
 
 // --- Express endpoint
 app.post(
@@ -193,8 +262,8 @@ app.post(
     const { message } = req.body;
     if (!message)
       return res.status(400).json({ error: "Message is required." });
-    const reply = await handleChat(message);
-    res.json({ reply });
+    const { reply, source } = await handleChat(message);
+    res.json({ reply, source });
   })
 );
 
