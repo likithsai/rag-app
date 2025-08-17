@@ -197,10 +197,7 @@ async function handleChat(
     ],
   });
 
-  const userWantsDocs =
-    /fetch|search|documents?|pdf|txt|docx|csv|html|md/i.test(message);
-
-  if (vectorStore && userWantsDocs) {
+  if (vectorStore) {
     const retriever = vectorStore.asRetriever({ k: TOP_K });
     const relevantDocs = await retriever.getRelevantDocuments(message);
 
@@ -209,9 +206,17 @@ async function handleChat(
         .map((d) => d.metadata.summary || d.pageContent.slice(0, 500))
         .join("\n\n");
 
-      const prompt = PromptTemplate.fromTemplate(
-        `Answer based on context below. If not found, say so.\nContext:\n{context}\nQuestion:\n{question}\nAnswer:`
-      );
+      const prompt = PromptTemplate.fromTemplate(`
+        You are an AI assistant. Use the provided context to answer the user's question. 
+        If the answer cannot be found in the context, respond honestly that the information is not available.
+        Context:
+        {context}
+
+        Question:
+        {question}
+
+        Answer:
+      `);
 
       const chain = RunnableSequence.from([
         {
