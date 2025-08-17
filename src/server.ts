@@ -1,4 +1,3 @@
-// backend/src/server.ts
 import express, { Request, Response, NextFunction } from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -29,18 +28,18 @@ dotenv.config();
 // --- Config
 const PORT = Number(process.env.PORT) || 5000;
 const PUBLIC_FOLDER = process.env.PUBLIC_FOLDER || "./public";
+const VECTOR_STORE_PATH = "./vector_store";
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "nomic-embed-text";
 const LLM_MODEL = process.env.LLM_MODEL || "llama3.1";
-const VECTOR_STORE_PATH = "./vector_store";
-const BATCH_SIZE = 5; // batch processing chunks
-const TOP_K = 5; // top retrieved documents
+const BATCH_SIZE = 5;
+const TOP_K = 5;
 const SUPPORTED_FILE_FORMATS = (
   process.env.SUPPORTED_FILE_FORMATS || ".pdf,.txt,.docx,.csv,.html,.md"
 )
   .split(",")
   .map((f) => f.trim().toLowerCase());
 
-// --- Logger setup
+// --- Logger
 const logger = winston.createLogger({
   level: "info",
   format: winston.format.printf(({ level, message }) => {
@@ -49,8 +48,9 @@ const logger = winston.createLogger({
       warn: "\x1b[33m",
       error: "\x1b[31m",
     };
-    const color = colors[level] || "\x1b[0m";
-    return `${color}[${level.toUpperCase()}]\x1b[0m: ${message}`;
+    return `${
+      colors[level] || "\x1b[0m"
+    }[${level.toUpperCase()}]\x1b[0m: ${message}`;
   }),
   transports: [
     new winston.transports.Console(),
@@ -62,18 +62,17 @@ const logger = winston.createLogger({
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
-app.use((req: Request, _res: Response, next: NextFunction) => {
+app.use((req, _res, next) => {
   const methodColors: Record<string, string> = {
     GET: "\x1b[34m",
     POST: "\x1b[32m",
     PUT: "\x1b[33m",
     DELETE: "\x1b[31m",
   };
-  const color = methodColors[req.method] || "\x1b[0m";
   console.log(
-    `[${color}${req.method}\x1b[0m]: ${req.url} ${
-      req.method === "POST" ? JSON.stringify(req.body) : ""
-    }`
+    `[${methodColors[req.method] || "\x1b[0m"}${req.method}\x1b[0m]: ${
+      req.url
+    } ${req.method === "POST" ? JSON.stringify(req.body) : ""}`
   );
   next();
 });
@@ -85,7 +84,6 @@ let vectorStore: HNSWLib | null = null;
 const fileExists = (p: string) => fs.existsSync(p);
 const isSupportedFile = (filePath: string) =>
   SUPPORTED_FILE_FORMATS.includes(path.extname(filePath).toLowerCase());
-
 const getAllFiles = (folderPath: string): string[] =>
   fileExists(folderPath)
     ? fs.readdirSync(folderPath, { withFileTypes: true }).flatMap((item) => {
@@ -98,47 +96,50 @@ const getAllFiles = (folderPath: string): string[] =>
       })
     : [];
 
-// --- Process file to text chunks
+// --- Process file
 async function processFile(filePath: string): Promise<Document[]> {
   try {
     const fileName = path.basename(filePath);
-    logger.info(`Processing file: ${fileName}`);
-
     let text = "";
-    const ext = path.extname(filePath).toLowerCase();
 
-    if (ext === ".pdf") text = (await pdfParse(fs.readFileSync(filePath))).text;
-    else if (ext === ".txt") text = fs.readFileSync(filePath, "utf-8");
-    else if (ext === ".docx")
-      text = (await mammoth.extractRawText({ path: filePath })).value;
-    else if (ext === ".csv") {
-      text = "";
-      await new Promise<void>((resolve) => {
-        fs.createReadStream(filePath)
-          .pipe(csvParser())
-          .on("data", (row) => {
-            text += Object.values(row).join(" ") + "\n";
-          })
-          .on("end", () => resolve());
-      });
-    } else if (ext === ".html") {
-      const html = fs.readFileSync(filePath, "utf-8");
-      text = new JSDOM(html).window.document.body.textContent || "";
-    } else if (ext === ".md") text = fs.readFileSync(filePath, "utf-8");
+    switch (path.extname(filePath).toLowerCase()) {
+      case ".pdf":
+        text = (await pdfParse(fs.readFileSync(filePath))).text;
+        break;
+      case ".txt":
+        text = fs.readFileSync(filePath, "utf-8");
+        break;
+      case ".docx":
+        text = (await mammoth.extractRawText({ path: filePath })).value;
+        break;
+      case ".csv":
+        text = "";
+        await new Promise<void>((resolve) => {
+          fs.createReadStream(filePath)
+            .pipe(csvParser())
+            .on("data", (row) => {
+              text += Object.values(row).join(" ") + "\n";
+            })
+            .on("end", () => resolve());
+        });
+        break;
+      case ".html":
+        text =
+          new JSDOM(fs.readFileSync(filePath, "utf-8")).window.document.body
+            .textContent || "";
+        break;
+      case ".md":
+        text = fs.readFileSync(filePath, "utf-8");
+        break;
+    }
 
     const splitter = new RecursiveCharacterTextSplitter({
       chunkSize: 500,
       chunkOverlap: 50,
     });
-
     const chunks = await splitter.splitDocuments([
       new Document({ pageContent: text, metadata: { source: fileName } }),
     ]);
-
-    chunks.forEach((chunk, idx) =>
-      logger.info(`[Chunk ${idx + 1}] from ${fileName}`)
-    );
-
     return chunks;
   } catch (err) {
     logger.error(`Failed to process ${filePath}: ${(err as Error).message}`);
@@ -153,7 +154,6 @@ async function initializeKnowledgeBase() {
     fs.mkdirSync(PUBLIC_FOLDER, { recursive: true });
 
   if (fileExists(VECTOR_STORE_PATH)) {
-    logger.info("Loading existing vector store...");
     vectorStore = await HNSWLib.load(VECTOR_STORE_PATH, embeddings);
     logger.info("Vector store loaded.");
     return;
@@ -161,20 +161,16 @@ async function initializeKnowledgeBase() {
 
   const files = getAllFiles(PUBLIC_FOLDER);
   if (!files.length) {
-    logger.warn("No files found in PUBLIC_FOLDER.");
+    logger.warn("No files found.");
     return;
   }
 
-  logger.info(`Found ${files.length} files. Processing in batches...`);
-
   let allDocs: Document[] = [];
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
-    const batchFiles = files.slice(i, i + BATCH_SIZE);
-    const batchDocs = (await Promise.all(batchFiles.map(processFile))).flat();
-    allDocs = allDocs.concat(batchDocs);
-    logger.info(
-      `Processed batch ${i / BATCH_SIZE + 1}, total chunks: ${allDocs.length}`
-    );
+    const batchDocs = (
+      await Promise.all(files.slice(i, i + BATCH_SIZE).map(processFile))
+    ).flat();
+    allDocs.push(...batchDocs);
   }
 
   vectorStore = await HNSWLib.fromDocuments(allDocs, embeddings);
@@ -182,119 +178,91 @@ async function initializeKnowledgeBase() {
   logger.info(`Knowledge base initialized with ${allDocs.length} chunks.`);
 }
 
+// --- Add to RAG
+async function addToVectorStore(text: string, sourceName = "dynamic-chat") {
+  if (!vectorStore || !text.trim()) return;
+  const hash = crypto.createHash("sha256").update(text).digest("hex");
+  if (
+    (vectorStore as any).docs?.some((d: Document) => d.metadata.hash === hash)
+  )
+    return;
+  await vectorStore.addDocuments([
+    new Document({ pageContent: text, metadata: { source: sourceName, hash } }),
+  ]);
+  await vectorStore.save(VECTOR_STORE_PATH);
+}
+
 // --- Chat handler
-async function handleChat(
-  message: string,
-  useRAG?: boolean
-): Promise<{ reply: string; source: "RAG" | "LLM" }> {
+async function handleChat(message: string, useRAG?: boolean) {
   const llm = new Ollama({
     model: LLM_MODEL,
     temperature: 0.7,
-    callbacks: [
-      {
-        handleLLMNewToken(token: string) {
-          process.stdout.write(token); // continuous token printing
-        },
-      },
-    ],
+    callbacks: [{ handleLLMNewToken: (token) => process.stdout.write(token) }],
   });
 
   let contextText = "";
   let source: "RAG" | "LLM" = "LLM";
 
-  // --- RAG retrieval
   if (vectorStore && useRAG) {
     const retriever = vectorStore.asRetriever({ k: TOP_K });
-    const relevantDocs = await retriever.getRelevantDocuments(message);
-
-    if (relevantDocs.length) {
-      contextText = relevantDocs
+    const docs = await retriever.getRelevantDocuments(message);
+    if (docs.length) {
+      contextText = docs
         .map((d) => d.metadata.summary || d.pageContent.slice(0, 500))
         .join("\n\n");
       source = "RAG";
     }
   }
 
-  // --- Single prompt
-  const promptTemplate = `
+  const prompt = PromptTemplate.fromTemplate(`
     You are a helpful AI assistant.
     ${
       contextText
         ? "Use the provided context to answer the user's question.\nContext:\n{context}"
         : ""
     }
-    
+
     Question:
     {question}
 
     Answer:
-  `;
-  const prompt = PromptTemplate.fromTemplate(promptTemplate);
-
+  `);
   const chain = RunnableSequence.from([
     { context: new RunnablePassthrough(), question: new RunnablePassthrough() },
     prompt,
     llm,
     new StringOutputParser(),
   ]);
+  const reply = await chain.invoke({ context: contextText, question: message });
 
-  const reply = await chain.invoke({
-    context: contextText,
-    question: message,
-  });
-
-  // --- Update RAG dynamically with new info if applicable
-  if (vectorStore) {
-    const newInfoHash = crypto.createHash("sha256").update(reply).digest("hex");
-
-    // Check if this response is already in the vector store
-    const exists = (vectorStore as any).docs?.some(
-      (d: Document) => d.metadata.hash === newInfoHash
-    );
-
-    if (!exists) {
-      const newDoc = new Document({
-        pageContent: reply,
-        metadata: { source: "dynamic-chat", hash: newInfoHash },
-      });
-
-      // Only pass the document array; embeddings are handled internally
-      await vectorStore.addDocuments([newDoc]);
-      await vectorStore.save(VECTOR_STORE_PATH);
-
-      console.log("\n[RAG] Added new info to vector store dynamically.");
-    }
-  }
-
+  await addToVectorStore(reply);
   return { reply, source };
 }
 
-// --- Vector store stats endpoint
-app.get("/vector-stats", async (_req, res) => {
+// --- Routes
+app.get("/vector-stats", (_req: Request, res: Response) => {
   if (!vectorStore)
     return res.status(404).json({ error: "Vector store not initialized." });
-  const stats = {
+  res.json({
     totalVectors: (vectorStore as any).docs?.length || 0,
     files: getAllFiles(PUBLIC_FOLDER).length,
     topK: TOP_K,
     supportedFormats: SUPPORTED_FILE_FORMATS,
-  };
-  res.json(stats);
+  });
 });
 
-// --- Express endpoint
 app.post(
   "/chat",
   asyncHandler(async (req: Request, res: Response) => {
-    const { message } = req.body;
+    const { message, useRAG } = req.body;
     if (!message)
       return res.status(400).json({ error: "Message is required." });
-    const { reply, source } = await handleChat(message);
+    const { reply, source } = await handleChat(message, useRAG);
     res.json({ reply, source });
   })
 );
 
-// --- Async handler wrapper
+// --- Async wrapper
 function asyncHandler(fn: Function) {
   return (req: Request, res: Response, next: NextFunction) =>
     Promise.resolve(fn(req, res, next)).catch(next);
@@ -314,6 +282,6 @@ initializeKnowledgeBase()
     )
   )
   .catch((err) => {
-    logger.error(`Fatal startup error: ${(err as Error).message}`);
+    logger.error(`Startup error: ${(err as Error).message}`);
     process.exit(1);
   });

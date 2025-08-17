@@ -14,7 +14,9 @@ export const config = {
   VECTOR_STORE_PATH: process.env.VECTOR_STORE_PATH
     ? path.resolve(process.cwd(), process.env.VECTOR_STORE_PATH)
     : path.resolve(process.cwd(), "vector_store"),
-  SUPPORTED_FORMATS: (process.env.SUPPORTED_FORMATS || ".pdf,.txt,.docx")
+  SUPPORTED_FORMATS: (
+    process.env.SUPPORTED_FORMATS || ".pdf,.txt,.docx,.csv,.html,.md"
+  )
     .split(",")
     .map((f) => f.trim().toLowerCase()),
 };
