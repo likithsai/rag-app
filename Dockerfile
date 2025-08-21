@@ -1,25 +1,19 @@
-# Use Node 20 slim for smaller image
 FROM node:18
 
-# Set working directory
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y build-essential python3
-RUN npm install hnswlib-node
+# Install build tools
+RUN apt-get update && apt-get install -y build-essential python3 git
 
 COPY ./package*.json ./
 
-# Install dependencies ignoring peer dependency conflicts
-RUN npm ci --legacy-peer-deps --vebrose
+# Force build hnswlib-node from source (ignore prebuilds)
+RUN npm install --build-from-source=hnswlib-node --legacy-peer-deps --verbose
 
-# Copy source code
 COPY . .
 
-# Copy .env file into container
 COPY .env .env
 
-# Expose port from .env (default fallback 5000)
 EXPOSE ${PORT:-5001}
 
-# Run the server
 CMD ["npx", "ts-node", "src/server.ts"]
