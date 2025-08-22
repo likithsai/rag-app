@@ -17,6 +17,7 @@ import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
 import { Document } from "langchain/document";
 import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
 import { PromptTemplate } from "@langchain/core/prompts";
+import { tools } from "./tools";
 
 dotenv.config();
 
@@ -186,58 +187,46 @@ async function handleChat(message: string, useRAG = false) {
   const llm = new Ollama({
     model: LLM_MODEL,
     temperature: 0.7,
-    callbacks: [{ handleLLMNewToken: (t) => process.stdout.write(t) }],
   });
 
   let contextText = "";
-  let source: "RAG" | "LLM" = "LLM";
-
   if (vectorStore && useRAG) {
     const retriever = vectorStore.asRetriever({ k: TOP_K });
     const docs = await retriever.invoke(message);
     if (docs.length) {
       contextText = docs.map((d) => d.pageContent.slice(0, 300)).join("\n\n");
-      source = "RAG";
     }
   }
 
-  const prompt = PromptTemplate.fromTemplate(`
-    You are an advanced AI agent with access to multiple tools.
-    All tools are implemented as separate modules inside the **tools/** folder.
+  // Let LLM decide which tool to use
+  const routerPrompt = PromptTemplate.fromTemplate(`
+    You are a tool router.
+    Decide which tool to use based on the question.
 
-    Available tools:
-    - codingTool: For solving programming problems across ALL programming languages.
-    - default: For general questions, explanations, or reasoning.
-
-    ### Available Tools:
-    - **codingTool** (from tools/codingTool.ts): For solving programming problems across ALL programming languages.
+    ## Available tools:
+    - **codingTool**: For solving programming problems across ALL programming languages.
     - **default**: For general questions, explanations, or reasoning.
 
-    Instructions:
+    Question: {question}
+
+    ## Instructions:
     1. Always analyze the user's question carefully.
-    2. If the question is related to coding, debugging, or requires generating code, use **codingTool**.
-    3. Otherwise, use **default**.
-    4. If context is provided, make sure to use it to enhance/improve your answer.
+    2. If context is provided, make sure to use it to enhance/improve your answer.
 
-    ${contextText ? "Context:\n{context}\n" : ""}
-
-    User Question:
-    {question}
-
-    Your Task:
-    - Decide which tool to call (codingTool or defaultTool).
-    - Provide the best possible answer.
-
-    Decide the correct tool and provide the best possible answer.
-    Answer:
+    Respond ONLY with the tool name (Example: "codingTool" or "default" or any other tool).
   `);
 
-  const reply = await llm.invoke(
-    await prompt.format({ context: contextText, question: message })
+  const toolChoice = await llm.invoke(
+    await routerPrompt.format({ question: message })
   );
 
+  const toolName = toolChoice.trim().toLowerCase();
+  const tool = tools[toolName] || tools.default;
+
+  const reply = await tool.run({ question: message, context: contextText });
   await addToVectorStore(reply);
-  return { reply, source };
+
+  return { reply, source: toolName };
 }
 
 // --- Routes
