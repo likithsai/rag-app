@@ -2,9 +2,10 @@
 import { PromptTemplate } from "@langchain/core/prompts";
 import { LLMChain } from "langchain/chains";
 import { Ollama } from "@langchain/community/llms/ollama";
-import { Tool, ToolInput } from "./baseTool";
+import { BaseTool } from "../classes/baseTool";
+import { ToolInput } from "../interfaces/tools";
 
-export class DefaultTool implements Tool {
+export class DefaultTool implements BaseTool {
   name = "defaultTool";
   description =
     "General-purpose tool that returns answers directly from the LLM for coding or other questions.";

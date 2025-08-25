@@ -2,18 +2,22 @@ FROM node:18
 
 WORKDIR /app
 
-# Install build tools
-RUN apt-get update && apt-get install -y build-essential python3 git
+# Install build tools required for hnswlib-node
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
-COPY ./package*.json ./
+# Copy only package.json first for caching
+COPY package*.json ./
 
-# Force build hnswlib-node from source (ignore prebuilds)
+# Install deps (force build hnswlib-node from source)
 RUN npm install --build-from-source=hnswlib-node --legacy-peer-deps --verbose
 
+# Copy rest of app
 COPY . .
 
-COPY .env .env
+# Build TypeScript into dist/
+RUN npm run build
 
 EXPOSE ${PORT:-5001}
 
-CMD ["npx", "ts-node", "src/server.ts"]
+# Run compiled JS, not ts-node
+CMD ["node", "dist/server.js"]
