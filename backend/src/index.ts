@@ -18,6 +18,7 @@ import { Document } from "langchain/document";
 import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
 import { PromptTemplate } from "@langchain/core/prompts";
 import { tools } from "./tools";
+import pkg from "../package.json";
 
 dotenv.config();
 
@@ -64,17 +65,18 @@ let vectorStore: HNSWLib | null = null;
 const fileExists = (p: string) => fs.existsSync(p);
 const isSupportedFile = (filePath: string) =>
   SUPPORTED_FILE_FORMATS.includes(path.extname(filePath).toLowerCase());
-const getAllFiles = (folderPath: string): string[] =>
-  fileExists(folderPath)
-    ? fs.readdirSync(folderPath, { withFileTypes: true }).flatMap((item) => {
-        const fullPath = path.join(folderPath, item.name);
-        return item.isDirectory()
-          ? getAllFiles(fullPath)
-          : item.isFile() && isSupportedFile(fullPath)
-          ? [fullPath]
-          : [];
-      })
-    : [];
+
+const getAllFiles = (folderPath: string): string[] => {
+  if (!fileExists(folderPath)) return [];
+  return fs.readdirSync(folderPath, { withFileTypes: true }).flatMap((item) => {
+    const fullPath = path.join(folderPath, item.name);
+    return item.isDirectory()
+      ? getAllFiles(fullPath)
+      : item.isFile() && isSupportedFile(fullPath)
+      ? [fullPath]
+      : [];
+  });
+};
 
 // --- Process file into docs
 async function processFile(filePath: string): Promise<Document[]> {
@@ -82,32 +84,32 @@ async function processFile(filePath: string): Promise<Document[]> {
   let text = "";
 
   try {
-    switch (path.extname(filePath).toLowerCase()) {
+    const ext = path.extname(filePath).toLowerCase();
+    const fileBuffer = fs.readFileSync(filePath);
+
+    switch (ext) {
       case ".pdf":
-        text = (await pdfParse(fs.readFileSync(filePath))).text;
+        text = (await pdfParse(fileBuffer)).text;
         break;
       case ".txt":
       case ".md":
-        text = fs.readFileSync(filePath, "utf-8");
+        text = fileBuffer.toString("utf-8");
         break;
       case ".docx":
         text = (await mammoth.extractRawText({ path: filePath })).value;
         break;
       case ".csv":
-        await new Promise<void>((resolve) => {
+        text = await new Promise<string>((resolve) => {
           const chunks: string[] = [];
           fs.createReadStream(filePath)
             .pipe(csvParser())
             .on("data", (row) => chunks.push(Object.values(row).join(" ")))
-            .on("end", () => {
-              text = chunks.join("\n");
-              resolve();
-            });
+            .on("end", () => resolve(chunks.join("\n")));
         });
         break;
       case ".html":
         text =
-          new JSDOM(fs.readFileSync(filePath, "utf-8")).window.document.body
+          new JSDOM(fileBuffer.toString("utf-8")).window.document.body
             .textContent || "";
         break;
     }
@@ -119,7 +121,7 @@ async function processFile(filePath: string): Promise<Document[]> {
       chunkOverlap: 50,
     });
 
-    return await splitter.splitDocuments([
+    return splitter.splitDocuments([
       new Document({ pageContent: text, metadata: { source: fileName } }),
     ]);
   } catch (err) {
@@ -135,23 +137,19 @@ async function initializeKnowledgeBase() {
 
     if (fileExists(VECTOR_STORE_PATH)) {
       vectorStore = await HNSWLib.load(VECTOR_STORE_PATH, embeddings);
-      logger.info("Vector store loaded.");
+      logger.info("Vector store loaded from disk.");
       return;
     }
 
     const files = getAllFiles(PUBLIC_FOLDER);
     if (!files.length) {
-      logger.warn("No files found in knowledge base.");
+      logger.warn("No files found in knowledge base folder.");
       return;
     }
 
-    const allDocs: Document[] = [];
-    for (let i = 0; i < files.length; i += BATCH_SIZE) {
-      const batchDocs = (
-        await Promise.all(files.slice(i, i + BATCH_SIZE).map(processFile))
-      ).flat();
-      allDocs.push(...batchDocs);
-    }
+    const allDocs = (
+      await Promise.all(files.map((f) => processFile(f)))
+    ).flat();
 
     if (!allDocs.length) {
       logger.warn("No documents processed for knowledge base.");
@@ -171,10 +169,9 @@ async function addToVectorStore(text: string, sourceName = "chat") {
   if (!vectorStore || !text.trim()) return;
 
   const hash = crypto.createHash("sha256").update(text).digest("hex");
-  if (
-    (vectorStore as any).docs?.some((d: Document) => d.metadata.hash === hash)
-  )
-    return;
+  const docs = (vectorStore as any)?.docs || [];
+
+  if (docs.some((d: Document) => d.metadata.hash === hash)) return;
 
   await vectorStore.addDocuments([
     new Document({ pageContent: text, metadata: { source: sourceName, hash } }),
@@ -184,49 +181,39 @@ async function addToVectorStore(text: string, sourceName = "chat") {
 
 // --- Chat handler
 async function handleChat(message: string, useRAG = false) {
-  const llm = new Ollama({
-    model: LLM_MODEL,
-    temperature: 0.7,
-  });
+  const llm = new Ollama({ model: LLM_MODEL, temperature: 0.7 });
 
   let contextText = "";
   if (vectorStore && useRAG) {
     const retriever = vectorStore.asRetriever({ k: TOP_K });
     const docs = await retriever.invoke(message);
-    if (docs.length) {
-      contextText = docs.map((d) => d.pageContent.slice(0, 300)).join("\n\n");
-    }
+    contextText = docs.map((d) => d.pageContent.slice(0, 300)).join("\n\n");
   }
 
-  // Let LLM decide which tool to use
   const routerPrompt = PromptTemplate.fromTemplate(`
     You are a tool router.
     Decide which tool to use based on the question.
 
     ## Available tools:
-    - **codingTool**: For solving programming problems across ALL programming languages.
-    - **default**: For general questions, explanations, or reasoning.
+    - codingTool → for programming problems.
+    - default → for general reasoning.
 
     Question: {question}
-
-    ## Instructions:
-    1. Always analyze the user's question carefully.
-    2. If context is provided, make sure to use it to enhance/improve your answer.
-
-    Respond ONLY with the tool name (Example: "codingTool" or "default" or any other tool).
+    Respond ONLY with tool name.
   `);
 
-  const toolChoice = await llm.invoke(
-    await routerPrompt.format({ question: message })
-  );
+  const toolChoice = (
+    await llm.invoke(await routerPrompt.format({ question: message }))
+  )
+    ?.trim()
+    .toLowerCase();
 
-  const toolName = toolChoice.trim().toLowerCase();
-  const tool = tools[toolName] || tools.default;
-
+  const tool = tools[toolChoice] || tools.default;
   const reply = await tool.run({ question: message, context: contextText });
+
   await addToVectorStore(reply);
 
-  return { reply, source: toolName };
+  return { reply, source: toolChoice };
 }
 
 // --- Routes
@@ -266,8 +253,14 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 // --- Start server
-initializeKnowledgeBase().finally(() =>
-  app.listen(PORT, () =>
-    logger.info(`Server running at http://localhost:${PORT}`)
-  )
-);
+console.log(`\n${pkg.name} v${pkg.version}`);
+
+initializeKnowledgeBase().finally(() => {
+  app.listen(PORT, () => {
+    logger.info("✅ Server started successfully");
+    logger.info(`🌐 Running at: http://localhost:${PORT}`);
+    logger.info(
+      `⚙️ Node: ${process.version}, Embeddings: ${EMBEDDING_MODEL}, LLM: ${LLM_MODEL}`
+    );
+  });
+});

@@ -7,7 +7,7 @@ const WebpackObfuscator = require('webpack-obfuscator');
 module.exports = {
     mode: "production", // ensures minification
     target: "node",     // build for Node.js
-    entry: "./src/server.ts", // your entry file (change if needed)
+    entry: "./src/index.ts", // your entry file (change if needed)
     output: {
         path: path.resolve(__dirname, "dist"),
         filename: "server.min.js",
