@@ -1,40 +1,26 @@
-import express, { Request, Response, NextFunction } from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
+import crypto from "crypto";
+import csvParser from "csv-parser";
+import express, { NextFunction, Request, Response } from "express";
 import fs from "fs";
+import { JSDOM } from "jsdom";
+import mammoth from "mammoth";
 import path from "path";
 import pdfParse from "pdf-parse";
-import mammoth from "mammoth";
-import csvParser from "csv-parser";
-import { JSDOM } from "jsdom";
 import winston from "winston";
-import dotenv from "dotenv";
-import crypto from "crypto";
 
-import { Ollama } from "@langchain/community/llms/ollama";
 import { OllamaEmbeddings } from "@langchain/community/embeddings/ollama";
-import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
-import { Document } from "langchain/document";
+import { Ollama } from "@langchain/community/llms/ollama";
 import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
 import { PromptTemplate } from "@langchain/core/prompts";
-import { tools } from "./tools";
+import { Document } from "langchain/document";
+import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
 import pkg from "../package.json";
+import { Config } from "./config";
+import { tools } from "./tools";
 
-dotenv.config();
-
-// --- Config
-const PORT = Number(process.env.PORT) || 5000;
-const PUBLIC_FOLDER = process.env.PUBLIC_FOLDER || "./public";
-const VECTOR_STORE_PATH = "./vector_store";
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "nomic-embed-text";
-const LLM_MODEL = process.env.LLM_MODEL || "llama3.1";
-const BATCH_SIZE = 5;
 const TOP_K = 5;
-const SUPPORTED_FILE_FORMATS = (
-  process.env.SUPPORTED_FILE_FORMATS || ".pdf,.txt,.docx,.csv,.html,.md"
-)
-  .split(",")
-  .map((f) => f.trim().toLowerCase());
 
 // --- Logger
 const logger = winston.createLogger({
@@ -64,7 +50,7 @@ let vectorStore: HNSWLib | null = null;
 // --- Helpers
 const fileExists = (p: string) => fs.existsSync(p);
 const isSupportedFile = (filePath: string) =>
-  SUPPORTED_FILE_FORMATS.includes(path.extname(filePath).toLowerCase());
+  Config.SUPPORTED_FORMATS.includes(path.extname(filePath).toLowerCase());
 
 const getAllFiles = (folderPath: string): string[] => {
   if (!fileExists(folderPath)) return [];
@@ -133,15 +119,15 @@ async function processFile(filePath: string): Promise<Document[]> {
 // --- Initialize knowledge base
 async function initializeKnowledgeBase() {
   try {
-    const embeddings = new OllamaEmbeddings({ model: EMBEDDING_MODEL });
+    const embeddings = new OllamaEmbeddings({ model: Config.EMBEDDING_MODEL });
 
-    if (fileExists(VECTOR_STORE_PATH)) {
-      vectorStore = await HNSWLib.load(VECTOR_STORE_PATH, embeddings);
+    if (fileExists(Config.VECTOR_STORE_PATH)) {
+      vectorStore = await HNSWLib.load(Config.VECTOR_STORE_PATH, embeddings);
       logger.info("Vector store loaded from disk.");
       return;
     }
 
-    const files = getAllFiles(PUBLIC_FOLDER);
+    const files = getAllFiles(Config.PUBLIC_FOLDER);
     if (!files.length) {
       logger.warn("No files found in knowledge base folder.");
       return;
@@ -157,7 +143,7 @@ async function initializeKnowledgeBase() {
     }
 
     vectorStore = await HNSWLib.fromDocuments(allDocs, embeddings);
-    await vectorStore.save(VECTOR_STORE_PATH);
+    await vectorStore.save(Config.VECTOR_STORE_PATH);
     logger.info(`Knowledge base initialized with ${allDocs.length} chunks.`);
   } catch (err) {
     logger.error(`Knowledge base init failed: ${(err as Error).message}`);
@@ -176,12 +162,16 @@ async function addToVectorStore(text: string, sourceName = "chat") {
   await vectorStore.addDocuments([
     new Document({ pageContent: text, metadata: { source: sourceName, hash } }),
   ]);
-  await vectorStore.save(VECTOR_STORE_PATH);
+  await vectorStore.save(Config.VECTOR_STORE_PATH);
 }
 
 // --- Chat handler
 async function handleChat(message: string, useRAG = false) {
-  const llm = new Ollama({ model: LLM_MODEL, temperature: 0.7 });
+  const llm = new Ollama({
+    model: Config.OLLAMA_MODEL,
+    temperature: 0.7,
+    baseUrl: `${Config.OLLAMA_BASE_URL}:${Config.OLLAMA_PORT}`,
+  });
 
   let contextText = "";
   if (vectorStore && useRAG) {
@@ -220,9 +210,9 @@ async function handleChat(message: string, useRAG = false) {
 app.get("/vector-stats", (_req, res) => {
   res.json({
     totalVectors: (vectorStore as any)?.docs?.length || 0,
-    files: getAllFiles(PUBLIC_FOLDER).length,
+    files: getAllFiles(Config.PUBLIC_FOLDER).length,
     topK: TOP_K,
-    supportedFormats: SUPPORTED_FILE_FORMATS,
+    supportedFormats: Config.SUPPORTED_FORMATS,
   });
 });
 
@@ -256,11 +246,11 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 console.log(`\n${pkg.name} v${pkg.version}`);
 
 initializeKnowledgeBase().finally(() => {
-  app.listen(PORT, () => {
+  app.listen(Config.PORT, () => {
     logger.info("✅ Server started successfully");
-    logger.info(`🌐 Running at: http://localhost:${PORT}`);
+    logger.info(`🌐 Running at: http://localhost:${Config.PORT}`);
     logger.info(
-      `⚙️ Node: ${process.version}, Embeddings: ${EMBEDDING_MODEL}, LLM: ${LLM_MODEL}`
+      `⚙️ Node: ${process.version}, Embeddings: ${Config.EMBEDDING_MODEL}, LLM: ${Config.OLLAMA_MODEL}`
     );
   });
 });
