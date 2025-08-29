@@ -2,5 +2,6 @@ vector_store
 node_modules
 dist
 logs
+ollama_data
 
 package-lock.json

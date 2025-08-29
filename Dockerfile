@@ -17,4 +17,4 @@ RUN npm run build
 EXPOSE ${PORT:-5001}
 
 # Run compiled JS, not ts-node
-CMD ["node", "dist/server.js"]
+CMD ["node", "dist/server.min.js"]

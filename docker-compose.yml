@@ -17,8 +17,8 @@ services:
     container_name: ollama
     ports:
       - "${OLLAMA_PORT}:11434" # Ollama default port
-    environment:
-      - OLLAMA_MODEL=${OLLAMA_MODEL} # Replace with the model you want
+    # environment:
+    #   - OLLAMA_MODEL=${OLLAMA_MODEL} # Replace with the model you want
     restart: unless-stopped
-    volumes:
-      - "./ollama_data:/ollama_data" # persistent data
+    # volumes:
+    #   - "./ollama_data:/ollama_data" # persistent data

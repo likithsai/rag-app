@@ -21,6 +21,7 @@ import { Config } from "./config";
 import { tools } from "./tools";
 
 const TOP_K = 5;
+const OLLAMA_SERVER = `${Config.OLLAMA_BASE_URL}:${Config.OLLAMA_PORT}`;
 
 // --- Logger
 const logger = winston.createLogger({
@@ -119,7 +120,10 @@ async function processFile(filePath: string): Promise<Document[]> {
 // --- Initialize knowledge base
 async function initializeKnowledgeBase() {
   try {
-    const embeddings = new OllamaEmbeddings({ model: Config.EMBEDDING_MODEL });
+    const embeddings = new OllamaEmbeddings({
+      model: Config.EMBEDDING_MODEL,
+      baseUrl: OLLAMA_SERVER,
+    });
 
     if (fileExists(Config.VECTOR_STORE_PATH)) {
       vectorStore = await HNSWLib.load(Config.VECTOR_STORE_PATH, embeddings);
@@ -170,7 +174,7 @@ async function handleChat(message: string, useRAG = false) {
   const llm = new Ollama({
     model: Config.OLLAMA_MODEL,
     temperature: 0.7,
-    baseUrl: `${Config.OLLAMA_BASE_URL}:${Config.OLLAMA_PORT}`,
+    baseUrl: OLLAMA_SERVER,
   });
 
   let contextText = "";
