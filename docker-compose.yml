@@ -9,3 +9,16 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "${OLLAMA_PORT}:11434" # Ollama default port
+    environment:
+      - OLLAMA_MODEL=${OLLAMA_MODEL} # Replace with the model you want
+    restart: unless-stopped
+    volumes:
+      - "./ollama_data:/ollama_data" # persistent data
