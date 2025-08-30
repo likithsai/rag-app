@@ -12,16 +12,19 @@ import winston from "winston";
 
 import { OllamaEmbeddings } from "@langchain/community/embeddings/ollama";
 import { Ollama } from "@langchain/community/llms/ollama";
-import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
 import { PromptTemplate } from "@langchain/core/prompts";
 import { Document } from "langchain/document";
 import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
+import { ChromaClient } from "chromadb";
+import { Chroma } from "@langchain/community/vectorstores/chroma";
+
 import pkg from "../package.json";
 import { Config } from "./config";
 import { tools } from "./tools";
 
 const TOP_K = 5;
 const OLLAMA_SERVER = `${Config.OLLAMA_BASE_URL}:${Config.OLLAMA_PORT}`;
+const CHROMA_URL = Config.CHROMA_URL;
 
 // --- Logger
 const logger = winston.createLogger({
@@ -45,8 +48,9 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- Vector store (lazy init)
-let vectorStore: HNSWLib | null = null;
+// --- Vector store via Chroma
+const chroma = new ChromaClient({ path: CHROMA_URL });
+let collection: any = null;
 
 // --- Helpers
 const fileExists = (p: string) => fs.existsSync(p);
@@ -121,52 +125,68 @@ async function processFile(filePath: string): Promise<Document[]> {
 async function initializeKnowledgeBase() {
   try {
     const embeddings = new OllamaEmbeddings({
-      model: Config.EMBEDDING_MODEL,
+      model: Config.EMBEDDING_MODEL, // e.g. "nomic-embed-text"
       baseUrl: OLLAMA_SERVER,
     });
 
-    if (fileExists(Config.VECTOR_STORE_PATH)) {
-      vectorStore = await HNSWLib.load(Config.VECTOR_STORE_PATH, embeddings);
-      logger.info("Vector store loaded from disk.");
-      return;
+    // Create or load collection
+    collection = await Chroma.fromExistingCollection(embeddings, {
+      collectionName: "rag-app",
+      url: CHROMA_URL,
+    }).catch(async () => {
+      logger.info("No existing collection, creating new one...");
+
+      const files = getAllFiles(Config.PUBLIC_FOLDER);
+      if (!files.length) {
+        logger.warn("No files found in knowledge base folder.");
+        return null;
+      }
+
+      const allDocs = (
+        await Promise.all(files.map((f) => processFile(f)))
+      ).flat();
+
+      if (!allDocs.length) {
+        logger.warn("No documents processed for knowledge base.");
+        return null;
+      }
+
+      const store = await Chroma.fromDocuments(allDocs, embeddings, {
+        collectionName: "rag-app",
+        url: CHROMA_URL,
+      });
+
+      logger.info(`Knowledge base initialized with ${allDocs.length} chunks.`);
+      return store;
+    });
+
+    if (collection) {
+      logger.info("✅ Chroma collection ready");
+    } else {
+      logger.warn("⚠️ Knowledge base not initialized");
     }
-
-    const files = getAllFiles(Config.PUBLIC_FOLDER);
-    if (!files.length) {
-      logger.warn("No files found in knowledge base folder.");
-      return;
-    }
-
-    const allDocs = (
-      await Promise.all(files.map((f) => processFile(f)))
-    ).flat();
-
-    if (!allDocs.length) {
-      logger.warn("No documents processed for knowledge base.");
-      return;
-    }
-
-    vectorStore = await HNSWLib.fromDocuments(allDocs, embeddings);
-    await vectorStore.save(Config.VECTOR_STORE_PATH);
-    logger.info(`Knowledge base initialized with ${allDocs.length} chunks.`);
   } catch (err) {
     logger.error(`Knowledge base init failed: ${(err as Error).message}`);
   }
 }
 
-// --- Add chat replies to RAG
+// --- Add chat replies to vector store
 async function addToVectorStore(text: string, sourceName = "chat") {
-  if (!vectorStore || !text.trim()) return;
+  if (!collection || !text.trim()) return;
 
   const hash = crypto.createHash("sha256").update(text).digest("hex");
-  const docs = (vectorStore as any)?.docs || [];
 
-  if (docs.some((d: Document) => d.metadata.hash === hash)) return;
+  const embedding = await new OllamaEmbeddings({
+    model: Config.EMBEDDING_MODEL,
+    baseUrl: OLLAMA_SERVER,
+  }).embedQuery(text);
 
-  await vectorStore.addDocuments([
-    new Document({ pageContent: text, metadata: { source: sourceName, hash } }),
-  ]);
-  await vectorStore.save(Config.VECTOR_STORE_PATH);
+  await collection.add({
+    ids: [hash],
+    documents: [text],
+    metadatas: [{ source: sourceName, hash }],
+    embeddings: [embedding],
+  });
 }
 
 // --- Chat handler
@@ -178,10 +198,19 @@ async function handleChat(message: string, useRAG = false) {
   });
 
   let contextText = "";
-  if (vectorStore && useRAG) {
-    const retriever = vectorStore.asRetriever({ k: TOP_K });
-    const docs = await retriever.invoke(message);
-    contextText = docs.map((d) => d.pageContent.slice(0, 300)).join("\n\n");
+  if (collection && useRAG) {
+    const embeddings = new OllamaEmbeddings({
+      model: Config.EMBEDDING_MODEL,
+      baseUrl: OLLAMA_SERVER,
+    });
+    const queryEmbedding = await embeddings.embedQuery(message);
+
+    const results = await collection.query({
+      queryEmbeddings: [queryEmbedding],
+      nResults: TOP_K,
+    });
+
+    contextText = (results.documents[0] || []).join("\n\n");
   }
 
   const routerPrompt = PromptTemplate.fromTemplate(`
@@ -211,13 +240,19 @@ async function handleChat(message: string, useRAG = false) {
 }
 
 // --- Routes
-app.get("/vector-stats", (_req, res) => {
-  res.json({
-    totalVectors: (vectorStore as any)?.docs?.length || 0,
-    files: getAllFiles(Config.PUBLIC_FOLDER).length,
-    topK: TOP_K,
-    supportedFormats: Config.SUPPORTED_FORMATS,
-  });
+// --- List files in RAG
+app.get("/rag-files", async (_req, res) => {
+  try {
+    const files = getAllFiles(Config.PUBLIC_FOLDER);
+
+    res.json({
+      totalFiles: files.length,
+      files,
+    });
+  } catch (err) {
+    logger.error(`Failed to fetch RAG files: ${(err as Error).message}`);
+    res.status(500).json({ error: "Failed to fetch RAG files" });
+  }
 });
 
 app.post(
@@ -243,13 +278,16 @@ function asyncHandler(
 // --- Global error handler
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   logger.error(err.message);
+  logger.error(err.stack);
   res.status(500).json({ error: err.message });
 });
 
 // --- Start server
 console.log(`\n${pkg.name} v${pkg.version}`);
 
-initializeKnowledgeBase().finally(() => {
+(async () => {
+  await initializeKnowledgeBase();
+
   app.listen(Config.PORT, () => {
     logger.info("✅ Server started successfully");
     logger.info(`🌐 Running at: http://localhost:${Config.PORT}`);
@@ -257,4 +295,4 @@ initializeKnowledgeBase().finally(() => {
       `⚙️ Node: ${process.version}, Embeddings: ${Config.EMBEDDING_MODEL}, LLM: ${Config.OLLAMA_MODEL}`
     );
   });
-});
+})();

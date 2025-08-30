@@ -11,14 +11,34 @@ services:
     restart: unless-stopped
     depends_on:
       - ollama
+      - chroma
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: chroma
+    ports:
+      - "8000:8000"
+    environment:
+      CHROMA_SERVER_HTTP_PORT: 8000
+    volumes:
+      - ./chroma:/chroma/chroma
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
     ports:
       - "${OLLAMA_PORT}:11434" # Ollama default port
-    # environment:
-    #   - OLLAMA_MODEL=${OLLAMA_MODEL} # Replace with the model you want
-    restart: unless-stopped
-    # volumes:
-    #   - "./ollama_data:/ollama_data" # persistent data
+    restart: always
+    volumes:
+      - "./ollama_data:/ollama_data" # persistent data
+    environment:
+      - OLLAMA_MODEL="${OLLAMA_MODEL}"
+      - OLLAMA_BASE_URL="${OLLAMA_BASE_URL}"
+      - OLLAMA_PORT=${OLLAMA_PORT}
+
+volumes:
+  ollama_data:
+    name: ollama_data
+  chroma_data:
+    name: chroma_data
