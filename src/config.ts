@@ -12,8 +12,8 @@ export const Config = {
   OLLAMA_BASE_URL: process.env.OLLAMA_BASE_URL || "http://localhost",
   OLLAMA_MODEL: process.env.OLLAMA_MODEL || "llama3.1",
   OLLAMA_PORT: process.env.OLLAMA_PORT || 11434,
-  CHROMA_URL: process.env.CHROMA_URL || "http://chroma:8000",
-  EMBEDDING_MODEL: process.env.EMBEDDING_MODEL || "nomic-embed-text",
+  CHROMA_HOST: process.env.CHROMA_HOST || "chroma",
+  CHROMA_PORT: Number(process.env.CHROMA_PORT || 8080),
   SUPPORTED_FORMATS: (
     process.env.SUPPORTED_FORMATS || ".pdf,.txt,.docx,.csv,.html,.md"
   )

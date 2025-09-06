@@ -24,7 +24,6 @@ import { tools } from "./tools";
 
 const TOP_K = 5;
 const OLLAMA_SERVER = `${Config.OLLAMA_BASE_URL}:${Config.OLLAMA_PORT}`;
-const CHROMA_URL = Config.CHROMA_URL;
 
 // --- Logger
 const logger = winston.createLogger({
@@ -48,8 +47,12 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- Vector store via Chroma
-const chroma = new ChromaClient({ path: CHROMA_URL });
+// --- Chroma setup
+const chroma = new ChromaClient({
+  host: Config.CHROMA_HOST,
+  port: Config.CHROMA_PORT,
+  ssl: false,
+});
 let collection: any = null;
 
 // --- Helpers
@@ -125,61 +128,56 @@ async function processFile(filePath: string): Promise<Document[]> {
 async function initializeKnowledgeBase() {
   try {
     const embeddings = new OllamaEmbeddings({
-      model: Config.EMBEDDING_MODEL, // e.g. "nomic-embed-text"
+      model: Config.OLLAMA_MODEL, // 👈 same LLaMA model
       baseUrl: OLLAMA_SERVER,
     });
 
-    // Create or load collection
-    collection = await Chroma.fromExistingCollection(embeddings, {
-      collectionName: "rag-app",
-      url: CHROMA_URL,
-    }).catch(async () => {
-      logger.info("No existing collection, creating new one...");
+    const files = getAllFiles(Config.PUBLIC_FOLDER);
+    if (!files.length) {
+      logger.warn("No files found in knowledge base folder.");
+      return;
+    }
 
-      const files = getAllFiles(Config.PUBLIC_FOLDER);
-      if (!files.length) {
-        logger.warn("No files found in knowledge base folder.");
-        return null;
-      }
+    const allDocs: Document[] = [];
+    for (const [index, file] of files.entries()) {
+      const docs = await processFile(file);
+      allDocs.push(...docs);
+      logger.info(`Processed ${index + 1}/${files.length}: ${file}`);
+    }
 
-      const allDocs = (
-        await Promise.all(files.map((f) => processFile(f)))
-      ).flat();
+    if (!allDocs.length) {
+      logger.warn("No documents processed for knowledge base.");
+      return;
+    }
 
-      if (!allDocs.length) {
-        logger.warn("No documents processed for knowledge base.");
-        return null;
-      }
-
-      const store = await Chroma.fromDocuments(allDocs, embeddings, {
+    try {
+      collection = await Chroma.fromExistingCollection(embeddings, {
         collectionName: "rag-app",
-        url: CHROMA_URL,
       });
-
-      logger.info(`Knowledge base initialized with ${allDocs.length} chunks.`);
-      return store;
-    });
-
-    if (collection) {
-      logger.info("✅ Chroma collection ready");
-    } else {
-      logger.warn("⚠️ Knowledge base not initialized");
+      logger.info("✅ Existing Chroma collection loaded");
+    } catch {
+      collection = await Chroma.fromDocuments(allDocs, embeddings, {
+        collectionName: "rag-app",
+      });
+      logger.info(
+        `✅ New Chroma collection created with ${allDocs.length} chunks`
+      );
     }
   } catch (err) {
     logger.error(`Knowledge base init failed: ${(err as Error).message}`);
   }
 }
-
 // --- Add chat replies to vector store
 async function addToVectorStore(text: string, sourceName = "chat") {
   if (!collection || !text.trim()) return;
 
   const hash = crypto.createHash("sha256").update(text).digest("hex");
 
-  const embedding = await new OllamaEmbeddings({
-    model: Config.EMBEDDING_MODEL,
+  const embeddings = new OllamaEmbeddings({
+    model: Config.OLLAMA_MODEL, // 👈 use LLaMA
     baseUrl: OLLAMA_SERVER,
-  }).embedQuery(text);
+  });
+  const embedding = await embeddings.embedQuery(text);
 
   await collection.add({
     ids: [hash],
@@ -200,7 +198,7 @@ async function handleChat(message: string, useRAG = false) {
   let contextText = "";
   if (collection && useRAG) {
     const embeddings = new OllamaEmbeddings({
-      model: Config.EMBEDDING_MODEL,
+      model: Config.OLLAMA_MODEL,
       baseUrl: OLLAMA_SERVER,
     });
     const queryEmbedding = await embeddings.embedQuery(message);
@@ -240,11 +238,9 @@ async function handleChat(message: string, useRAG = false) {
 }
 
 // --- Routes
-// --- List files in RAG
 app.get("/rag-files", async (_req, res) => {
   try {
     const files = getAllFiles(Config.PUBLIC_FOLDER);
-
     res.json({
       totalFiles: files.length,
       files,
@@ -255,17 +251,59 @@ app.get("/rag-files", async (_req, res) => {
   }
 });
 
-app.post(
-  "/chat",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { message, useRAG } = req.body;
-    if (!message)
-      return res.status(400).json({ error: "Message is required." });
+// Chat without RAG
+app.post("/chat", async (req, res) => {
+  try {
+    const { prompt } = req.body;
 
-    const { reply, source } = await handleChat(message, useRAG);
-    res.json({ reply, source });
-  })
-);
+    // call Ollama LLM
+    const response = await fetch(`http://${OLLAMA_SERVER}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "llama3.2:latest",
+        prompt,
+        stream: false,
+      }),
+    });
+
+    const data = await response.json();
+    const reply = data.response || "";
+
+    res.json({
+      answer: `[LLM] ${reply}`, // 👈 prefix
+      source: "ollama",
+      context: "LLM only",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Chat failed" });
+  }
+});
+
+// --- RAG Query endpoint for Open-WebUI
+// Chat with RAG
+app.post("/rag/query", async (req, res) => {
+  try {
+    const { query } = req.body;
+
+    // get or create collection
+    const collection = await chroma.getOrCreateCollection({
+      name: "my_collection",
+    });
+
+    // query embeddings
+    const results = await collection.query({
+      queryTexts: [query], // text to search
+      nResults: 3, // top 3 results
+    });
+
+    res.json(results);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "RAG query failed" });
+  }
+});
 
 // --- Async wrapper
 function asyncHandler(
@@ -291,8 +329,6 @@ console.log(`\n${pkg.name} v${pkg.version}`);
   app.listen(Config.PORT, () => {
     logger.info("✅ Server started successfully");
     logger.info(`🌐 Running at: http://localhost:${Config.PORT}`);
-    logger.info(
-      `⚙️ Node: ${process.version}, Embeddings: ${Config.EMBEDDING_MODEL}, LLM: ${Config.OLLAMA_MODEL}`
-    );
+    logger.info(`⚙️ Node: ${process.version}, LLM: ${Config.OLLAMA_MODEL}`);
   });
 })();

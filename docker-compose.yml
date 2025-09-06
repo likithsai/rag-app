@@ -33,12 +33,28 @@ services:
     volumes:
       - "./ollama_data:/ollama_data" # persistent data
     environment:
-      - OLLAMA_MODEL="${OLLAMA_MODEL}"
-      - OLLAMA_BASE_URL="${OLLAMA_BASE_URL}"
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_PORT=${OLLAMA_PORT}
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434 # connect to the Ollama container
+      - WEBUI_AUTH=False # disable login (optional)
+    depends_on:
+      - ollama
+    restart: unless-stopped
 
 volumes:
   ollama_data:
     name: ollama_data
   chroma_data:
     name: chroma_data
+  open-webui-data:
+    name: open-webui-data
